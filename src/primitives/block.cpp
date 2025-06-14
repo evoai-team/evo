@@ -6,6 +6,8 @@
 #include <primitives/block.h>
 #include <hash.h>
 #include <tinyformat.h>
+#include <stdint.h>
+#include <stdio.h>
 
 uint256 CBlockHeader::GetHash() const
 {
@@ -14,7 +16,12 @@ uint256 CBlockHeader::GetHash() const
 
 uint256 CBlockHeader::GetPoWHash() const
 {
-    return t5_hash(BEGIN(nVersion), END(nNonce));
+    if(nTime < 1749866400) {
+        return evo_hash(BEGIN(nVersion), END(nNonce));
+    } else { // > 2025-06-14 10:00:00
+        return evo2_hash(BEGIN(nVersion), END(nNonce));
+    }
+
 }
 
 std::string CBlock::ToString() const

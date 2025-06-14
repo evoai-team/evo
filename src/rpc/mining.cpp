@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <amount.h>
+#include <util/system.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <consensus/consensus.h>
@@ -33,9 +34,15 @@
 #include <validationinterface.h>
 #include <versionbitsinfo.h>
 #include <warnings.h>
-
+#include <boost/thread/thread.hpp>
+#include <boost/thread.hpp>
+#include <boost/tuple/tuple.hpp>
 #include <memory>
 #include <stdint.h>
+#define THREAD_PRIORITY_LOWEST 20
+/** Default max iterations to try in RPC generatetodescriptor, generatetoaddress, and generateblock. */
+static const uint64_t DEFAULT_MAX_TRIES{1000000};
+static boost::thread_group* minerThreads = NULL;
 
 /**
  * Return average network hashes per second based on the last 'lookup' blocks,
@@ -189,6 +196,54 @@ static UniValue generatetodescriptor(const JSONRPCRequest& request)
     return generateBlocks(mempool, coinbase_script.at(0), num_blocks, max_tries);
 }
 
+static void BitcoinMiner(const CTxMemPool& mempool, const CScript& coinbase_script, int nGenerate, uint64_t nMaxTries)
+{
+    LogPrintf("evo-Miner -- started\n");
+
+    try {
+
+        int nHeightEnd = 0;
+        int nHeight = 0;
+
+        {   // Don't keep cs_main locked
+            LOCK(cs_main);
+            nHeight = ::ChainActive().Height();
+            nHeightEnd = nHeight+nGenerate;
+        }
+        unsigned int nExtraNonce = 0;
+        UniValue blockHashes(UniValue::VARR);
+        while (nHeight < nHeightEnd && !ShutdownRequested())
+        {
+            std::unique_ptr<CBlockTemplate> pblocktemplate(BlockAssembler(mempool, Params()).CreateNewBlock(coinbase_script));
+            if (!pblocktemplate.get())
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
+            CBlock *pblock = &pblocktemplate->block;
+
+            uint256 block_hash;
+            if (!generateBlocks(mempool,coinbase_script, nGenerate, nMaxTries).empty()) {
+                break;
+            }
+
+            if (!block_hash.IsNull()) {
+                ++nHeight;
+                blockHashes.push_back(block_hash.GetHex());
+            }
+
+            boost::this_thread::interruption_point();
+        }
+    }
+    catch (const boost::thread_interrupted&)
+    {
+        LogPrintf("evo-miner -- terminated\n");
+        throw;
+    }
+    catch (const std::runtime_error &e)
+    {
+        LogPrintf("evo-miner -- runtime error: %s\n", e.what());
+        return;
+    }
+}
+
 static UniValue generatetoaddress(const JSONRPCRequest& request)
 {
             RPCHelpMan{"generatetoaddress",
@@ -197,6 +252,7 @@ static UniValue generatetoaddress(const JSONRPCRequest& request)
                     {"nblocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "How many blocks are generated immediately."},
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The address to send the newly generated bitcoin to."},
                     {"maxtries", RPCArg::Type::NUM, /* default */ "1000000", "How many iterations to try."},
+                    {"nThreads", RPCArg::Type::NUM, RPCArg::Optional::NO, "(numeric, optional) Set the processor limit for when generation is on. Can be -1 for unlimited."},
                 },
                 RPCResult{
                     RPCResult::Type::ARR, "", "hashes of blocks generated",
@@ -211,22 +267,62 @@ static UniValue generatetoaddress(const JSONRPCRequest& request)
                 },
             }.Check(request);
 
-    int nGenerate = request.params[0].get_int();
-    uint64_t nMaxTries = 1000000;
-    if (!request.params[2].isNull()) {
-        nMaxTries = request.params[2].get_int();
-    }
+//    int nGenerate = request.params[0].get_int();
+//    uint64_t nMaxTries = 1000000;
+//    if (!request.params[2].isNull()) {
+//        nMaxTries = request.params[2].get_int();
+//    }
+//
+//    CTxDestination destination = DecodeDestination(request.params[1].get_str());
+//    if (!IsValidDestination(destination)) {
+//        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address");
+//    }
+//
+//    const CTxMemPool& mempool = EnsureMemPool();
+//
+//    CScript coinbase_script = GetScriptForDestination(destination);
+//
+//    return generateBlocks(mempool, coinbase_script, nGenerate, nMaxTries);
 
+    const int num_blocks{request.params[0].get_int()};
+//    LogPrintf("num_blocks=%i.............\n", num_blocks);
+    const uint64_t max_tries{request.params[2].isNull() ? DEFAULT_MAX_TRIES : request.params[2].get_int()};
+//    LogPrintf("max_tries=%i.............\n", max_tries);
+    int nThreads{request.params[3].get_int()};
+//    LogPrintf("nThreads=%i,.............\n", nThreads);
     CTxDestination destination = DecodeDestination(request.params[1].get_str());
+//    LogPrintf("address=%s.............\n", request.params[1].get_str());
     if (!IsValidDestination(destination)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address");
     }
-
+//
+//    NodeContext& node = EnsureAnyNodeContext(request.context);
     const CTxMemPool& mempool = EnsureMemPool();
-
     CScript coinbase_script = GetScriptForDestination(destination);
+    UniValue blockHashes(UniValue::VARR);
 
-    return generateBlocks(mempool, coinbase_script, nGenerate, nMaxTries);
+    if (minerThreads != NULL)
+    {
+        minerThreads->interrupt_all();
+        delete minerThreads;
+        minerThreads = NULL;
+    }
+    if (nThreads == 0)
+    {
+        blockHashes.push_back("false");
+        return blockHashes;
+    }else  {
+        if (nThreads < 0)
+            nThreads = GetNumCores();
+    }
+    minerThreads = new boost::thread_group();
+    for (int i = 0; i < nThreads; i++)
+    {
+        minerThreads->create_thread(boost::bind(&BitcoinMiner, boost::ref(mempool),boost::ref(coinbase_script),num_blocks,max_tries));
+    }
+    LogPrintf("minerThreads size：%i.............\n",nThreads,minerThreads->size());
+    blockHashes.push_back("true");
+    return blockHashes;
 }
 
 static UniValue getmininginfo(const JSONRPCRequest& request)
@@ -1038,7 +1134,7 @@ static const CRPCCommand commands[] =
     { "mining",             "submitheader",           &submitheader,           {"hexdata"} },
 
 
-    { "generating",         "generatetoaddress",      &generatetoaddress,      {"nblocks","address","maxtries"} },
+    { "generating",         "generatetoaddress",      &generatetoaddress,      {"nblocks","address","maxtries","threads"} },
     { "generating",         "generatetodescriptor",   &generatetodescriptor,   {"num_blocks","descriptor","maxtries"} },
 
     { "util",               "estimatesmartfee",       &estimatesmartfee,       {"conf_target", "estimate_mode"} },

@@ -164,7 +164,6 @@ if TARGET_WINDOWS
 deploy: $(BITCOIN_WIN_INSTALLER)
 endif
 
-# 移除或注释掉与 GUI 二进制文件编译相关的规则
 # $(BITCOIN_QT_BIN): FORCE
 # 	$(MAKE) -C src qt/$(@F)
 
@@ -177,8 +176,8 @@ $(BITCOIN_CLI_BIN): FORCE
 $(BITCOIN_TX_BIN): FORCE
 	$(MAKE) -C src $(@F)
 
-$(BITCOIN_WALLET_BIN): FORCE
-	$(MAKE) -C src $(@F)
+#$(BITCOIN_WALLET_BIN): FORCE
+#	$(MAKE) -C src $(@F)
 
 if USE_LCOV
 LCOV_FILTER_PATTERN = \
